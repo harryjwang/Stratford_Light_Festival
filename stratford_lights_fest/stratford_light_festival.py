@@ -2,28 +2,36 @@ import cv2
 import numpy as np
 from ultralytics import YOLO
 
-MODEL_NAME   = "yolov8n-seg.pt"   # segmentation model
-SOURCE       = 1                   # webcam index or "video.mp4"
+# ------------------------------ Tunables ------------------------------
+MODEL_NAME   = "yolov8n-seg.pt"   # YOLOv8 segmentation model
+SOURCE       = 1                  # camera index or "video.mp4"
 CONF_THRESH  = 0.5
 LINE_THICK   = 2
 
-# -------- Display / performance --------
+# Display
 FULLSCREEN      = True
-DISPLAY_SIZE    = (1920, 1080)   # final window size; set to None to skip resize
+DISPLAY_SIZE    = (1920, 1080)    # final window size; set None to skip resize
 
-# -------- Fixed non-repeating color palette (BGR) --------
+# Performance knobs for Ultralytics
+IMGSZ       = 640                 # inference size (smaller = faster)
+VID_STRIDE  = 1                   # process every Nth frame (2/3 for speed)
+MAX_DET     = 8                   # cap number of people per frame
+
+# Color palette (BGR) - non-repeating per track ID
 PALETTE = [
-    (0, 0, 255),     # Red
-    (0, 51, 255),    # Bright Red
-    (0, 255, 255),   # Yellow
-    (255, 165, 0),   # Orange
-    (0, 128, 255),   # Light Orange
-    (0, 100, 255),   # Deep Orange
+    # (0, 0, 255),     # Red
+    # (0, 51, 255),    # Bright Red
+    # (0, 255, 255),   # Yellow
+    # (255, 165, 0),   # Orange
+    # (0, 128, 255),   # Light Orange
+    # (0, 100, 255),   # Deep Orange
+    
 ]
 
+# ------------------------------ Helpers ------------------------------
 def distinct_color_from_index(k: int):
     """If we run out of PALETTE colors, generate a new distinct color deterministically."""
-    hue = (k * 37) % 180  # OpenCV HSV hue in [0,180)
+    hue = (k * 37) % 180  # OpenCV HSV hue [0,180)
     hsv = np.uint8([[[hue, 255, 255]]])
     bgr = cv2.cvtColor(hsv, cv2.COLOR_HSV2BGR)
     return tuple(int(c) for c in bgr[0, 0])
@@ -37,82 +45,96 @@ def mask_centroid(mask_u8):
     return (cx, cy)
 
 def smoothstep(edge0, edge1, x):
-    """Smooth S-curve mapping x from [edge0,edge1] to [0,1]."""
     if edge1 == edge0:
         return 0.0
     t = (x - edge0) / (edge1 - edge0)
     t = np.clip(t, 0.0, 1.0)
     return t * t * (3 - 2 * t)
 
+# ------------------------------ Main ------------------------------
 def main():
     cv2.setUseOptimized(True)
 
-    win_name = "People Outlines (Tracked + Motion-Scaled Ripples)"
+    # Fullscreen window
+    win_name = "People Outlines (Tracked + Full-Screen Ripples)"
     cv2.namedWindow(win_name, cv2.WINDOW_NORMAL)
     if FULLSCREEN:
         cv2.setWindowProperty(win_name, cv2.WND_PROP_FULLSCREEN, cv2.WINDOW_FULLSCREEN)
 
     model = YOLO(MODEL_NAME)
-    # model.to('cuda')  # optional GPU
+    # model.to('cuda')  # optional if you have CUDA
 
-    # Persistent color per tracked ID and pointer to next unused palette index
+    # Persistent state
     id_colors = {}
     next_color_idx = 0
 
-    # Per-ID state: centroid + smoothed brightness + smoothed radius + prev small mask
-    #   track_id -> {"last_center": (x,y),
-    #   "strength": float,
-    #   "radius": float,
-    #   "prev_mask_small": np.ndarray[uint8] (h_s, w_s)}
+    # track_id -> {"last_center": (x,y), "strength": float, "radius": float, "prev_mask_small": np.ndarray}
     id_state = {}
 
-    # ---- Motion/Aura tuning ----
-    # Combine center motion (pixels) + shape motion (mask IoU change)
-    MOTION_THRESH_CENTROID = 2.0   # px: ignore tiny centroid jitter
-    MOTION_LOW             = 2.0   # combined motion where aura starts to grow
-    MOTION_HIGH            = 18.0  # combined motion where aura maxes out
+    # -------------------------- Motion/Aura tuning --------------------------
+    # Combined motion = weighted centroid shift (px) + shape change (IoU delta mapped to px)
+    MOTION_THRESH_CENTROID = 2.0
+    MOTION_LOW             = 1.5
+    MOTION_HIGH            = 8.0
+    W_CENTER               = 0.4
+    W_SHAPE                = 0.6
+    SHAPE_TO_PX            = 80.0
+    SHAPE_MASK_SIZE        = (64, 64)  # (w, h)
 
-    # Balance center vs. shape motion
-    W_CENTER = 0.4
-    W_SHAPE  = 0.6
-
-    # Convert shape change (0..1) to "pixel-equivalent" scale so it mixes well with centroid px
-    SHAPE_TO_PX = 40.0  # ↑ makes hand/arm motion influence larger
-
-    # Small mask used for shape motion (fast + robust)
-    SHAPE_MASK_SIZE = (64, 64)  # (w, h). Keep small for speed.
-
-    # Brightness (opacity) smoothing
+    # Brightness smoothing
     STRENGTH_MIN     = 0.18
-    STRENGTH_MAX     = 0.90   # a bit brighter to make ripples pop
-    STRENGTH_EMA     = 0.85   # higher = smoother/slower brightness changes
+    STRENGTH_MAX     = 0.90
+    STRENGTH_EMA     = 0.85
 
-    # Radius grows with motion, also smoothed
+    # Radius smoothing (RADIUS_MAX will be set dynamically per frame to screen diagonal)
     RADIUS_BASE      = 30.0
-    RADIUS_MAX       = 320.0  # allow a bit wider reach
-    RADIUS_EMA       = 0.55   # higher = smoother/slower radius changes
+    RADIUS_EMA       = 0.55
 
-    # Base gradient shape
-    FALL_OFF_LEN     = 45.0   # larger = slower fade
-    GAMMA            = 1.25   # >1 softens near silhouette edge
+    # Base halo falloff
+    FALL_OFF_LEN     = 45.0
+    GAMMA            = 1.25
 
-    # -------- Ripple animation timer --------
+    # -------------------------- Ripple tuning (Gaussian-band rings) --------------------------
+    # Motion-scaled ranges; more motion -> more rings, more contrast, faster, wider reach
+    WAVELENGTH_MAX = 150.0   # px between rings at rest (wide)
+    WAVELENGTH_MIN = 10.0    # px at high motion (dense rings)
+    AMP_MIN        = 0.30    # low contrast at rest
+    AMP_MAX        = 1.00    # strong contrast when moving
+    SHARP_MIN      = 1.3     # softer ring edges at rest
+    SHARP_MAX      = 3.5     # crisp ring edges at motion
+    SPEED_BASE     = 0.4     # Hz at rest
+    SPEED_MAX      = 2.5     # Hz at high motion
+    # Gaussian bandwidth as fraction of wavelength: controls ring thickness/softness
+    BANDWIDTH_MIN  = 0.12    # 12% of wavelength at rest
+    BANDWIDTH_MAX  = 0.30    # 30% at high motion
+
+    # Timer for phase animation
     t0 = cv2.getTickCount()
 
-    # Built-in tracker with persistent IDs
+    # Tracking loop
     for result in model.track(
         source=SOURCE,
-        classes=[0],           # person only
+        classes=[0],          # person
         conf=CONF_THRESH,
-        persist=True,          # stable IDs across frames
+        imgsz=IMGSZ,
+        vid_stride=VID_STRIDE,
+        max_det=MAX_DET,
+        persist=True,
         stream=True,
         verbose=False
     ):
-        # time (s) for ripple phase
+        # time in seconds for ripple animation
         t_sec = (cv2.getTickCount() - t0) / cv2.getTickFrequency()
 
+        # Frame canvas
         H, W = result.orig_img.shape[:2]
         frame = np.zeros((H, W, 3), dtype=np.uint8)
+
+        # Dynamic “full-screen” caps (so aura can reach corners)
+        DIAG = float(np.hypot(H, W))
+        RADIUS_MAX_DYNAMIC = DIAG                    # max radius = full diagonal
+        ATTEN_MIN          = 500.0                   # reach at rest
+        ATTEN_MAX_DYNAMIC  = DIAG * 2.0              # very wide propagation at motion
 
         if result.masks is None or result.boxes is None or len(result.boxes) == 0:
             out = cv2.resize(frame, DISPLAY_SIZE) if DISPLAY_SIZE else frame
@@ -122,6 +144,7 @@ def main():
                 break
             continue
 
+        # Track IDs
         ids = result.boxes.id
         if ids is None:
             boxes_xyxy = result.boxes.xyxy.cpu().numpy()
@@ -137,7 +160,7 @@ def main():
         for i, mask in enumerate(masks):
             track_id = int(ids[i])
 
-            # Assign color (no reuse)
+            # Assign persistent color
             if track_id not in id_colors:
                 if next_color_idx < len(PALETTE):
                     id_colors[track_id] = PALETTE[next_color_idx]
@@ -146,33 +169,28 @@ def main():
                 next_color_idx += 1
             color = np.array(id_colors[track_id], dtype=np.float32)
 
-            # Binary mask (uint8)
             mask_u8 = (mask * 255).astype(np.uint8)
 
-            # --- Compute center motion (px) ---
+            # --- Motion: centroid + shape change ---
             center = mask_centroid(mask_u8)
             center_motion = 0.0
-            prev_center = None
-
-            # --- Compute shape motion via small-mask IoU change ---
             m_small = cv2.resize(mask_u8, SHAPE_MASK_SIZE, interpolation=cv2.INTER_NEAREST)
-            m_small = (m_small > 127).astype(np.uint8)  # binarize 0/1
-
-            shape_motion_px = 0.0
-            prev_small = None
+            m_small = (m_small > 127).astype(np.uint8)
 
             if track_id not in id_state:
+                # Start bright and big, then respond to motion
                 id_state[track_id] = {
                     "last_center": center,
-                    "strength": STRENGTH_MIN,
-                    "radius": RADIUS_BASE,
+                    "strength": STRENGTH_MAX,
+                    "radius":   RADIUS_MAX_DYNAMIC,
                     "prev_mask_small": m_small
                 }
+                prev_center = None
+                prev_small  = None
             else:
                 prev_center = id_state[track_id]["last_center"]
                 prev_small  = id_state[track_id]["prev_mask_small"]
 
-            # Center motion
             if center is not None and prev_center is not None:
                 dx = center[0] - prev_center[0]
                 dy = center[1] - prev_center[1]
@@ -180,18 +198,17 @@ def main():
                 if center_motion < MOTION_THRESH_CENTROID:
                     center_motion = 0.0
 
-            # Shape motion: 1 - IoU between current and previous small masks
+            shape_motion_px = 0.0
             if prev_small is not None and prev_small.shape == m_small.shape:
                 inter = (m_small & prev_small).sum()
                 union = (m_small | prev_small).sum()
                 if union > 0:
-                    shape_change = 1.0 - (inter / union)  # 0=no change, 1=totally different
+                    shape_change = 1.0 - (inter / union)  # 0..1
                     shape_motion_px = shape_change * SHAPE_TO_PX
 
-            # Combined motion
             combined_motion = W_CENTER * center_motion + W_SHAPE * shape_motion_px
 
-            # ---- Map combined_motion -> strength & radius (with smoothing) ----
+            # --- Map motion to brightness and radius (with smoothing) ---
             t = smoothstep(MOTION_LOW, MOTION_HIGH, combined_motion)
 
             # Brightness
@@ -200,8 +217,8 @@ def main():
             strength = STRENGTH_EMA * prev_strength + (1.0 - STRENGTH_EMA) * target_strength
             id_state[track_id]["strength"] = strength
 
-            # Radius
-            target_radius = RADIUS_BASE + t * (RADIUS_MAX - RADIUS_BASE)
+            # Radius (max = full diagonal)
+            target_radius = RADIUS_BASE + t * (RADIUS_MAX_DYNAMIC - RADIUS_BASE)
             prev_radius = id_state[track_id]["radius"]
             radius = RADIUS_EMA * prev_radius + (1.0 - RADIUS_EMA) * target_radius
             id_state[track_id]["radius"] = radius
@@ -210,66 +227,54 @@ def main():
             id_state[track_id]["last_center"] = center
             id_state[track_id]["prev_mask_small"] = m_small
 
-            # --- Outer gradient aura only (inside stays black) ---
+            # --- Base gradient outside silhouette ---
             inv = 255 - mask_u8  # background=255, inside=0
             dist = cv2.distanceTransform(inv, cv2.DIST_L2, 3).astype(np.float32)
 
-            # Base gradient alpha (decays with distance, clamped by radius)
             alpha = np.exp(-dist / FALL_OFF_LEN)
+            # allow full-screen coverage when radius hits DIAG
             alpha[dist > radius] = 0.0
-            alpha[mask_u8 == 255] = 0.0  # inside stays black
+            alpha[mask_u8 == 255] = 0.0
             if GAMMA != 1.0:
                 alpha = np.power(alpha, GAMMA)
 
-            # -------- Motion-scaled ripple parameters (THIS is the big change) --------
-            # More motion -> more rings (smaller wavelength), stronger & crisper ripples, a bit faster
-            # -------- Motion-scaled ripple parameters (updated for more rings & propagation) --------
-            # More motion -> tighter wavelength (more rings), higher amplitude, sharper edges, faster speed, rings spread farther
-
-            WAVELENGTH_MAX = 25.0   # very wide spacing at rest
-            WAVELENGTH_MIN = 10.0    # many tight rings when moving a lot  (smaller = more rings)
-            AMP_MIN        = 0.85    # subtle at rest
-            AMP_MAX        = 0.95    # very strong at high motion
-            SHARP_MIN      = 1.2     # soft edges at rest
-            SHARP_MAX      = 3.0     # crisp edges at high motion
-            SPEED_BASE     = 1.0     # Hz at rest
-            SPEED_MAX      = 3.5     # much faster ripples at high motion
-            ATTEN_MIN      = 750.0   # rings fade sooner when still
-            ATTEN_MAX      = 2500.0   # rings propagate much farther when moving
-
-            # Scale parameters by motion "t" (0..1)
+            # --- Motion-scaled ripple parameters ---
             wavelength = WAVELENGTH_MAX - t * (WAVELENGTH_MAX - WAVELENGTH_MIN)
             amplitude  = AMP_MIN        + t * (AMP_MAX        - AMP_MIN)
             sharpness  = SHARP_MIN      + t * (SHARP_MAX      - SHARP_MIN)
             speed      = SPEED_BASE     + t * (SPEED_MAX      - SPEED_BASE)
-            atten_len  = ATTEN_MIN      + t * (ATTEN_MAX      - ATTEN_MIN)
+            atten_len  = ATTEN_MIN      + t * (ATTEN_MAX_DYNAMIC - ATTEN_MIN)
+            band_frac  = BANDWIDTH_MIN  + t * (BANDWIDTH_MAX  - BANDWIDTH_MIN)
+            sigma_px   = max(1.0, band_frac * wavelength / 2.355)  # Gaussian sigma from FWHM
 
-            # --- Ripple modulation ---
-            phase = (2.0 * np.pi) * ((dist / wavelength) - (speed * t_sec))
-            rings = 0.5 * (1.0 + np.cos(phase))          # 0..1
-            rings = np.power(rings, sharpness)           # sharpen edges
-            rings *= np.exp(-dist / max(1.0, atten_len)) # fade with distance
+            # Gaussian-band ripples (bright crest with soft fade)
+            phase_frac = (dist / max(1e-6, wavelength) - speed * t_sec) % 1.0
+            d_px = np.minimum(phase_frac, 1.0 - phase_frac) * wavelength
+            ring_profile = np.exp(-(d_px * d_px) / (2.0 * sigma_px * sigma_px))
+            # Gentle distance attenuation so rings persist to edges at high motion
+            ring_profile *= np.exp(-dist / max(1.0, atten_len))
 
             # Blend rings into base gradient
-            alpha = (1.0 - amplitude) * alpha + amplitude * (alpha * rings)
-
+            alpha = (1.0 - amplitude) * alpha + amplitude * (alpha * ring_profile)
 
             # Scale by smoothed per-ID brightness
-            alpha *= strength  # (H, W) in [0,1]
+            alpha *= strength  # [0,1]
 
             # Additive colorized aura
             aura_layer[..., 0] += alpha * color[0]
             aura_layer[..., 1] += alpha * color[1]
             aura_layer[..., 2] += alpha * color[2]
 
-            # --- Black silhouette + colored outline (crisp) ---
+            # Black interior + crisp colored outline
             frame[mask_u8 == 255] = (0, 0, 0)
             contours, _ = cv2.findContours(mask_u8, cv2.RETR_EXTERNAL, cv2.CHAIN_APPROX_SIMPLE)
             cv2.drawContours(frame, contours, -1, tuple(int(c) for c in color), LINE_THICK)
 
+        # Composite aura over the black background + outlines
         aura_layer = np.clip(aura_layer, 0, 255).astype(np.uint8)
         frame = np.maximum(frame, aura_layer)
 
+        # Show (fullscreen or sized)
         out = cv2.resize(frame, DISPLAY_SIZE) if DISPLAY_SIZE else frame
         cv2.imshow(win_name, out)
 

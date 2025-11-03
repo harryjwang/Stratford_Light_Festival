@@ -19,13 +19,17 @@ MAX_DET     = 8                   # cap number of people per frame
 
 # Color palette (BGR) - non-repeating per track ID
 PALETTE = [
-    # (0, 0, 255),     # Red
-    # (0, 51, 255),    # Bright Red
-    # (0, 255, 255),   # Yellow
-    # (255, 165, 0),   # Orange
-    # (0, 128, 255),   # Light Orange
-    # (0, 100, 255),   # Deep Orange
-    
+    # (0, 0, 255),      # Red
+    # (0, 51, 255),     # Bright Red
+    # (0, 255, 255),    # Yellow
+    # (255, 165, 0),    # Orange
+    # (0, 128, 255),    # Light Orange
+    # (0, 100, 255),    # Deep Orange
+    (191, 131, 82),     # Light Blue
+    (100, 194, 236),    # Faint Yellow
+    (80, 132, 233),     # Faint Orange
+    (208, 79, 135),     # Light Purple
+    (76, 157, 60),      # Magenta
 ]
 
 # ------------------------------ Helpers ------------------------------

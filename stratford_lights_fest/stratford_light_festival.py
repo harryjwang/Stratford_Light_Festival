@@ -4,7 +4,7 @@ from ultralytics import YOLO
 
 # ------------------------------ Tunables ------------------------------
 MODEL_NAME   = "yolov8n-seg.pt"   # YOLOv8 segmentation model
-SOURCE       = 1                  # camera index or "video.mp4"
+SOURCE       = 0                  # camera index or "video.mp4"
 CONF_THRESH  = 0.5
 LINE_THICK   = 2
 

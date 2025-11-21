@@ -19,11 +19,6 @@ MAX_DET     = 8                   # cap number of people per frame
 
 # Color palette (BGR) - non-repeating per track ID
 PALETTE = [
-    # (191, 131, 82),
-    # (100, 194, 236),
-    # (80, 132, 233),
-    # (208, 79, 135),
-    # (76, 157, 60),
     (191, 131, 82),     # Light Blue-ish / Warm tone
     (100, 194, 236),    # Faint Yellow / light cyan
     (80, 132, 233),     # Faint Orange-ish blue
@@ -32,8 +27,8 @@ PALETTE = [
 ]
 
 # Ghost walking / animation
-GHOST_WALK_SPEED = 3.0  # radians per second for limb swing
-GHOST_STEP_AMPL  = 0.7  # how much arms/legs swing (0.3–1.0)
+GHOST_WALK_SPEED  = 3.0   # radians per second for limb swing
+GHOST_STEP_AMPL   = 0.7   # how much arms/legs swing (0.3–1.0)
 GHOST_COLOR_SPEED = 0.15  # how fast hue cycles (bigger = faster color change)
 
 # ------------------------------ Helpers ------------------------------
@@ -59,15 +54,20 @@ def smoothstep(edge0, edge1, x):
     t = np.clip(t, 0.0, 1.0)
     return t * t * (3 - 2 * t)
 
-def draw_walking_human_silhouette(mask_u8, top_left, size, phase):
+def draw_walking_human_silhouette(mask_u8, top_left, size, phase, facing=1):
     """
-    Draw a walking human silhouette (thick-limbed stick figure) into mask_u8.
+    Draw a side-view walking human silhouette (thick-limbed stick figure) into mask_u8.
 
     - mask_u8: HxW uint8 mask, modified in-place (0/255)
     - top_left: (x, y) top-left of bounding region
     - size: (w, h) width/height of region
     - phase: float, walking phase in radians
+    - facing: +1 for facing right, -1 for facing left
     """
+    if facing == 0:
+        facing = 1
+    facing = 1 if facing > 0 else -1
+
     x, y = top_left
     w, h = size
     H, W = mask_u8.shape
@@ -80,7 +80,7 @@ def draw_walking_human_silhouette(mask_u8, top_left, size, phase):
 
     cx = x + w // 2
 
-    # Core body proportions
+    # Core body proportions (side view)
     head_radius  = int(0.12 * h)
     head_cy      = y + int(0.18 * h)
 
@@ -92,69 +92,68 @@ def draw_walking_human_silhouette(mask_u8, top_left, size, phase):
     limb_thick   = max(4, int(0.05 * h))
 
     # Limb lengths
-    arm_len      = (hip_y - shoulder_y) * 0.8
+    arm_len      = (hip_y - shoulder_y) * 0.95
     leg_len      = foot_y - hip_y
 
-    # Walking cycle: arms/legs swing with phase
+    # Walking cycle: arms/legs swing with phase (criss-cross profile)
     step = GHOST_STEP_AMPL
-    leg_angle_front  = step * np.sin(phase)
-    leg_angle_back   = -step * np.sin(phase)
-    arm_angle_front  = -step * np.sin(phase + np.pi)
-    arm_angle_back   = step * np.sin(phase + np.pi)
+    # Legs: one forward, one back
+    leg_angle_front  = step * np.sin(phase)          # front leg
+    leg_angle_back   = -step * np.sin(phase)         # back leg
+    # Arms: opposite to legs for natural walk
+    arm_angle_front  = -step * np.sin(phase + np.pi) # front arm
+    arm_angle_back   = step * np.sin(phase + np.pi)  # back arm
 
     def limb_endpoint(root_x, root_y, length, angle_from_vertical):
-        dx = length * np.sin(angle_from_vertical)
+        # angle_from_vertical > 0 = forward in facing direction
+        dx = length * np.sin(angle_from_vertical) * facing
         dy = length * np.cos(angle_from_vertical)
         return int(root_x + dx), int(root_y + dy)
 
     roi = mask_u8
 
-    # Head
-    cv2.circle(roi, (cx, head_cy), head_radius, 255, -1)
+    # Slight head offset in facing direction so it "leans" into motion
+    head_cx = cx + facing * int(0.06 * w)
 
-    # Torso
+    # Head
+    cv2.circle(roi, (head_cx, head_cy), head_radius, 255, -1)
+
+    # Torso (single vertical line for profile)
     cv2.line(roi, (cx, shoulder_y), (cx, hip_y), 255, torso_thick)
 
-    # Shoulders
-    shoulder_half = int(0.18 * w)
-    cv2.line(roi,
-             (cx - shoulder_half, shoulder_y),
-             (cx + shoulder_half, shoulder_y),
-             255,
-             torso_thick)
+    # Root joints for arms and legs (profile: both from center)
+    shoulder_x = cx
+    hip_x      = cx
 
-    # Hips
-    hip_half = int(0.12 * w)
-    cv2.line(roi,
-             (cx - hip_half, hip_y),
-             (cx + hip_half, hip_y),
-             255,
-             torso_thick)
+    # --- Compute arm endpoints ---
+    front_hand_x, front_hand_y = limb_endpoint(shoulder_x, shoulder_y,
+                                               arm_len, arm_angle_front)
+    back_hand_x,  back_hand_y  = limb_endpoint(shoulder_x, shoulder_y,
+                                               arm_len, arm_angle_back)
 
-    # Shoulders for arms
-    left_shoulder_x  = cx - shoulder_half
-    right_shoulder_x = cx + shoulder_half
+    # --- Compute leg endpoints ---
+    front_foot_x, front_foot_y = limb_endpoint(hip_x, hip_y,
+                                               leg_len, leg_angle_front)
+    back_foot_x,  back_foot_y  = limb_endpoint(hip_x, hip_y,
+                                               leg_len, leg_angle_back)
 
-    # Arms
-    left_hand_x, left_hand_y   = limb_endpoint(left_shoulder_x, shoulder_y, arm_len, arm_angle_front)
-    right_hand_x, right_hand_y = limb_endpoint(right_shoulder_x, shoulder_y, arm_len, arm_angle_back)
-    cv2.line(roi, (left_shoulder_x, shoulder_y), (left_hand_x, left_hand_y), 255, limb_thick)
-    cv2.line(roi, (right_shoulder_x, shoulder_y), (right_hand_x, right_hand_y), 255, limb_thick)
-
-    # Hips for legs
-    left_hip_x  = cx - hip_half
-    right_hip_x = cx + hip_half
-
-    # Legs
-    left_foot_x, left_foot_y   = limb_endpoint(left_hip_x, hip_y, leg_len, leg_angle_back)
-    right_foot_x, right_foot_y = limb_endpoint(right_hip_x, hip_y, leg_len, leg_angle_front)
-    cv2.line(roi, (left_hip_x, hip_y), (left_foot_x, left_foot_y), 255, limb_thick)
-    cv2.line(roi, (right_hip_x, hip_y), (right_foot_x, right_foot_y), 255, limb_thick)
-
-    # Feet blobs
     foot_r = max(3, int(0.03 * h))
-    cv2.circle(roi, (left_foot_x, left_foot_y),  foot_r, 255, -1)
-    cv2.circle(roi, (right_foot_x, right_foot_y), foot_r, 255, -1)
+
+    # Draw order: back limbs first, then torso, then front limbs
+    # so they visually "criss-cross" over the body
+
+    # Back arm and leg
+    cv2.line(roi, (shoulder_x, shoulder_y), (back_hand_x, back_hand_y), 255, limb_thick)
+    cv2.line(roi, (hip_x, hip_y), (back_foot_x, back_foot_y),           255, limb_thick)
+    cv2.circle(roi, (back_foot_x, back_foot_y), foot_r, 255, -1)
+
+    # Torso again to reinforce overlap
+    cv2.line(roi, (cx, shoulder_y), (cx, hip_y), 255, torso_thick)
+
+    # Front arm and leg (on top)
+    cv2.line(roi, (shoulder_x, shoulder_y), (front_hand_x, front_hand_y), 255, limb_thick)
+    cv2.line(roi, (hip_x, hip_y), (front_foot_x, front_foot_y),          255, limb_thick)
+    cv2.circle(roi, (front_foot_x, front_foot_y), foot_r, 255, -1)
 
 # ------------------------------ Main ------------------------------
 def main():
@@ -203,10 +202,12 @@ def main():
     BANDWIDTH_MAX  = 0.30
 
     ghost_id = -1
+    # Horizontal-only ghost:
     ghost_state = {
-        "pos": (300, 300),
-        "size": (160, 280),
-        "velocity": (2, 2),
+        "x": 300,             # current x (in pixels)
+        "vx": 3.0,            # horizontal speed (pixels/frame)
+        "size": (160, 280),   # (w, h)
+        "y_frac": 0.6,        # vertical position as fraction of H (0=top, 1=bottom)
     }
 
     t0 = cv2.getTickCount()
@@ -274,6 +275,15 @@ def main():
         if GAMMA != 1.0:
             alpha = np.power(alpha, GAMMA)
 
+        WAVELENGTH_MAX = 150.0
+        WAVELENGTH_MIN = 10.0
+        AMP_MIN        = 0.30
+        AMP_MAX        = 1.00
+        SPEED_BASE     = 0.4
+        SPEED_MAX      = 2.5
+        BANDWIDTH_MIN  = 0.12
+        BANDWIDTH_MAX  = 0.30
+
         wavelength = WAVELENGTH_MAX - t * (WAVELENGTH_MAX - WAVELENGTH_MIN)
         amplitude  = AMP_MIN        + t * (AMP_MAX        - AMP_MIN)
         speed      = SPEED_BASE     + t * (SPEED_MAX      - SPEED_BASE)
@@ -323,26 +333,31 @@ def main():
 
         # --------- CASE 1: No detections -> walking ghost with GRADIENT color ----------
         if result.masks is None or result.boxes is None or len(result.boxes) == 0:
-            x, y = ghost_state["pos"]
-            vx, vy = ghost_state["velocity"]
+            x = ghost_state["x"]
+            vx = ghost_state["vx"]
             w, h = ghost_state["size"]
+            y_frac = ghost_state["y_frac"]
 
+            # Vertical position fixed based on frame height
+            y = int(y_frac * H - h / 2)
+
+            # Horizontal motion only
             x += vx
-            y += vy
 
             if x < 0 or x > W - w:
                 vx = -vx
                 x = max(0, min(x, W - w))
-            if y < 0 or y > H - h:
-                vy = -vy
-                y = max(0, min(y, H - h))
 
-            ghost_state["pos"] = (x, y)
-            ghost_state["velocity"] = (vx, vy)
+            ghost_state["x"] = x
+            ghost_state["vx"] = vx
 
             ghost_mask = np.zeros((H, W), dtype=np.uint8)
             phase = t_sec * GHOST_WALK_SPEED
-            draw_walking_human_silhouette(ghost_mask, (x, y), (w, h), phase)
+
+            # Face in direction of horizontal velocity
+            facing = 1 if vx >= 0 else -1
+
+            draw_walking_human_silhouette(ghost_mask, (int(x), int(y)), (w, h), phase, facing=facing)
 
             # 🌈 Time-based gradient color for the ghost (hue cycles smoothly)
             hue = int((t_sec * 180 * GHOST_COLOR_SPEED) % 180)  # hue in [0,180)

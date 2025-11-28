@@ -1,6 +1,7 @@
 import cv2
 import numpy as np
 from ultralytics import YOLO
+import tkinter as tk
 
 # ------------------------------ Tunables ------------------------------
 MODEL_NAME   = "yolov8n-seg.pt"   # YOLOv8 segmentation model
@@ -8,9 +9,13 @@ SOURCE       = 0                  # camera index or "video.mp4"
 CONF_THRESH  = 0.5
 LINE_THICK   = 2
 
-# Display
+# Display - Auto-detect screen resolution
 FULLSCREEN      = True
-DISPLAY_SIZE    = (1920, 1080)    # final window size; set None to skip resize
+# Get screen resolution automatically
+root = tk.Tk()
+DISPLAY_SIZE    = (root.winfo_screenwidth(), root.winfo_screenheight())
+root.destroy()
+print(f"Detected screen resolution: {DISPLAY_SIZE[0]}x{DISPLAY_SIZE[1]}")
 
 # Performance knobs for Ultralytics
 IMGSZ       = 640                 # inference size (smaller = faster)
@@ -395,6 +400,10 @@ def main():
 
                 color = id_colors[track_id]
                 mask_u8 = (mask * 255).astype(np.uint8)
+                
+                # Resize mask to match frame dimensions
+                if mask_u8.shape[0] != H or mask_u8.shape[1] != W:
+                    mask_u8 = cv2.resize(mask_u8, (W, H), interpolation=cv2.INTER_NEAREST)
 
                 process_entity(mask_u8, track_id, color, aura_layer, frame,
                                H, W, t_sec, DIAG, RADIUS_MAX_DYNAMIC, ATTEN_MIN, ATTEN_MAX_DYNAMIC)
